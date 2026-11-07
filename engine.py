@@ -58,7 +58,7 @@ from dotenv import load_dotenv
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 import sys
 # Script location — used to resolve default relative paths.
@@ -360,9 +360,6 @@ class WooCommerceAPI:
 
     def fetch_all_products(self):
         """Fetch all existing products from WooCommerce to build a local cache."""
-        if self.dry_run:
-            return {}
-        
         self.log.info("Fetching all existing products from WooCommerce...")
         products_cache = {}
         page = 1
@@ -392,7 +389,7 @@ class WooCommerceAPI:
 
     def fetch_products_by_skus(self, skus):
         """Fetch only the specified SKUs from WooCommerce to build a target cache."""
-        if self.dry_run or not skus:
+        if not skus:
             return {}
         
         self.log.info("Fetching %d target products from WooCommerce...", len(skus))
@@ -1112,7 +1109,7 @@ def notify_progress(progress_callback, payload):
 def process_row(
     row, has_sku, has_item_num, images_dir,
     wp, cat_cache, attr_registry, logger, dry_run, variations_log_fh, debug_counter,
-    existing_products, skip_updates=False,
+    existing_products, skip_updates=False, skip_inserts=False,
     update_prices=True, update_stock=True, update_images=True, update_details=True, update_attributes=True
 ):
     """
@@ -1134,13 +1131,33 @@ def process_row(
         variations_log_fh.flush()
         return "skipped", None
 
+    existing_product = existing_products.get(sku)
+    existing_id = existing_product["id"] if existing_product else None
+
+    # --- Update Only Guard ---
+    if not existing_id and skip_inserts:
+        logger.debug("  SKU '%s' not in WooCommerce — skipping (Update Only Mode).", sku)
+        return "skipped", None
+
     # --- Price filter (Fixed Price eBay must be > 0) ---
     if not passes_price_filter(row, logger, sku):
         return "skipped", None
 
-    # --- Stock filter (Stock Total must be > 0) ---
-    if not passes_stock_filter(row, logger, sku):
-        return "skipped", None
+    # --- Stock quantity & filter ---
+    stock_qty = 0
+    raw_qty = row.get(COL_QTY, "").strip()
+    if raw_qty:
+        try:
+            stock_qty = int(Decimal(raw_qty))
+        except (InvalidOperation, ValueError):
+            stock_qty = 0
+
+    if stock_qty <= 0:
+        if existing_id:
+            pass  # Item exists in WC, allow it to proceed so WC stock is updated to 0
+        else:
+            logger.debug("  SKU '%s': New product but Qty is <= 0 — skipping.", sku)
+            return "skipped", None
 
     # --- Free postage filter ---
     if not passes_shipping_filter(row, logger, sku):
@@ -1156,19 +1173,6 @@ def process_row(
         logger.warning("  SKU '%s': could not transform price '%s' — skipping.", sku, raw_price)
         return "failed", None
 
-    # --- Stock quantity (primary: Qty Currently Listed) ---
-    stock_qty = None
-    raw_qty = row.get(COL_QTY, "").strip()
-    if raw_qty:
-        try:
-            stock_qty = int(Decimal(raw_qty))
-        except (InvalidOperation, ValueError):
-            stock_qty = None
-
-    # --- Fast Unchanged / Skip updates check ---
-    existing_product = existing_products.get(sku)
-    existing_id = existing_product["id"] if existing_product else None
-    
     if existing_id:
         if skip_updates:
             logger.debug("  SKU '%s' already exists — skipping (Insert Only Mode).", sku)
@@ -1504,8 +1508,10 @@ def run_ingestion(args):
             existing_id = existing_product["id"] if existing_product else None
             
             is_skipped = False
+            skip_updates_active = getattr(args, "skip_updates", False)
+            skip_inserts_active = getattr(args, "skip_inserts", False)
+
             if existing_id:
-                skip_updates_active = getattr(args, "skip_updates", False)
                 if skip_updates_active:
                     is_skipped = True
                 else:
@@ -1538,6 +1544,9 @@ def run_ingestion(args):
                         
                         if price_match and stock_match and name_match:
                             is_skipped = True
+            else:
+                if skip_inserts_active:
+                    is_skipped = True
             
             if is_skipped:
                 counters["skipped"] += 1
@@ -1582,6 +1591,7 @@ def run_ingestion(args):
                     wp, cat_cache, attr_registry, logger, args.dry_run, variations_log_fh, debug_counter,
                     existing_products, 
                     skip_updates=getattr(args, "skip_updates", False),
+                    skip_inserts=getattr(args, "skip_inserts", False),
                     update_prices=getattr(args, "update_prices", True),
                     update_stock=getattr(args, "update_stock", True),
                     update_images=getattr(args, "update_images", True),
@@ -1765,8 +1775,16 @@ class IngestionGui:
         ttk.Label(frame, text="Leave blank or 0 to process the full CSV").grid(row=2, column=2, sticky="e", pady=(0, 14))
 
         ttk.Label(frame, text="Import Mode").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=(0, 14))
-        self.import_mode_cb = ttk.Combobox(frame, values=["Update Existing Products", "Insert New Products Only"], state="readonly")
-        self.import_mode_cb.set("Update Existing Products")
+        self.import_mode_cb = ttk.Combobox(
+            frame,
+            values=[
+                "Update Existing Products Only",
+                "Insert New Products Only",
+                "Insert New & Update Existing",
+            ],
+            state="readonly",
+        )
+        self.import_mode_cb.set("Update Existing Products Only")
         self.import_mode_cb.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(0, 14))
 
         # Fields to Update Options Frame (row 4)
@@ -1792,7 +1810,7 @@ class IngestionGui:
         self.cb_attributes.pack(side="left", padx=10)
 
         def on_mode_change(event=None):
-            state = "normal" if self.import_mode_cb.get() == "Update Existing Products" else "disabled"
+            state = "disabled" if self.import_mode_cb.get() == "Insert New Products Only" else "normal"
             self.cb_prices.configure(state=state)
             self.cb_stock.configure(state=state)
             self.cb_images.configure(state=state)
@@ -1862,8 +1880,10 @@ WooCommerce Ingestion Engine Instructions
      WebP format, and deduplicated using MD5 hashes to prevent duplicate media uploads.
 
 3. IMPORT MODES
-   - UPDATE EXISTING PRODUCTS:
-     Updates catalog items that already exist in WooCommerce. You can selectively choose what to update:
+   - UPDATE EXISTING PRODUCTS ONLY:
+     Only updates catalog items that already exist in WooCommerce. Skips any SKU 
+     not already present in the store (preventing unreviewed items from being published).
+     You can selectively choose what to update:
      * Prices: Updates the regular price.
      * Stock: Updates stock levels and availability.
      * Images: Re-processes, WebP-compresses, and attaches supplier images.
@@ -1876,7 +1896,10 @@ WooCommerce Ingestion Engine Instructions
      If they are unchecked, the engine will automatically skip products 
      where name, price, and stock match to optimize speed.
    - INSERT NEW PRODUCTS ONLY:
-     Skips existing products. Useful for adding new stock additions quickly.
+     Skips existing products and only uploads brand new catalog additions.
+   - INSERT NEW & UPDATE EXISTING:
+     Full catalog synchronization: inserts new items and updates existing items 
+     according to the checked fields.
 
 4. MAX UPLOADS (Testing / Smoke Run)
    - Leave blank or set to 0 to run the entire feed.
@@ -1957,13 +1980,18 @@ WooCommerce Ingestion Engine Instructions
 
         log_handler = TkQueueLogHandler(self.events)
 
+        mode = self.import_mode_cb.get()
+        skip_updates = (mode == "Insert New Products Only")
+        skip_inserts = (mode == "Update Existing Products Only")
+
         args = argparse.Namespace(
             csv=csv_path,
             images_dir=images_dir,
             debug_limit=0,
             dry_run=False,
             upload_limit=upload_limit,
-            skip_updates=(self.import_mode_cb.get() == "Insert New Products Only"),
+            skip_updates=skip_updates,
+            skip_inserts=skip_inserts,
             update_prices=self.chk_prices.get(),
             update_stock=self.chk_stock.get(),
             update_images=self.chk_images.get(),
@@ -2070,12 +2098,24 @@ def launch_gui():
     root.mainloop()
 
 
-def main():
+class IngestionArgumentParser(argparse.ArgumentParser):
+    """Custom parser that resolves --mode, --skip-inserts, and --skip-updates."""
+
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args=args, namespace=namespace)
+        if parsed.skip_inserts is None:
+            parsed.skip_inserts = (parsed.mode == "update-only")
+        if parsed.skip_updates is None:
+            parsed.skip_updates = (parsed.mode == "insert-only")
+        return parsed
+
+
+def build_arg_parser():
     default_csv = DEFAULT_CSV_PATH
     if not os.path.isfile(DEFAULT_CSV_PATH) and os.path.isfile(DEFAULT_XML_PATH):
         default_csv = DEFAULT_XML_PATH
 
-    parser = argparse.ArgumentParser(
+    parser = IngestionArgumentParser(
         description="WooCommerce Ingestion Engine — Import lightbulbs CSV or XML via REST API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -2084,6 +2124,7 @@ def main():
             "  python3 engine.py --gui\n\n"
             "Examples:\n"
             "  python3 engine.py --csv /other/file.xml --auto\n"
+            "  python3 engine.py --mode update-only --auto\n"
             "  python3 engine.py --upload-limit 10 --auto\n"
             "  python3 engine.py --dry-run\n"
             "  python3 engine.py --debug-limit 5\n"
@@ -2112,6 +2153,28 @@ def main():
         "--upload-limit", type=int, default=0,
         metavar="N",
         help="Stop after N successful product creates/updates. Default: 0, process the full file.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["update-only", "insert-only", "insert-and-update"],
+        default="update-only",
+        help="Import mode: 'update-only' (skip new items), 'insert-only' (skip existing items), or 'insert-and-update' (process all). Default: update-only.",
+    )
+    parser.add_argument(
+        "--skip-inserts", dest="skip_inserts", action="store_true", default=None,
+        help="Skip products not already present in WooCommerce (Update Only Mode). Overrides --mode.",
+    )
+    parser.add_argument(
+        "--no-skip-inserts", dest="skip_inserts", action="store_false",
+        help="Do not skip non-existing products.",
+    )
+    parser.add_argument(
+        "--skip-updates", dest="skip_updates", action="store_true", default=None,
+        help="Skip products already present in WooCommerce (Insert Only Mode). Overrides --mode.",
+    )
+    parser.add_argument(
+        "--no-skip-updates", dest="skip_updates", action="store_false",
+        help="Do not skip existing products.",
     )
     parser.add_argument(
         "--no-update-prices", action="store_false", dest="update_prices", default=True,
@@ -2160,7 +2223,11 @@ def main():
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {VERSION}",
     )
+    return parser
 
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
     if args.gui or (len(sys.argv) == 1 and not args.cli):
         launch_gui()
