@@ -1309,7 +1309,7 @@ def bust_frontend_cache(logger):
     try:
         response = requests.post(
             endpoint,
-            json={"tags": ["wc-products", "wc-categories"]},
+            json={"tags": ["total-product-count", "wc-categories"], "paths": ["/"]},
             headers={
                 "x-revalidate-secret": revalidate_secret,
                 "Content-Type": "application/json",
